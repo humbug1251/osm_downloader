@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.streamlit/secrets.toml
+*.gpkg
+*.geojson
+*.osm.json
+*.shp
+*.dbf
+*.shx
+*.prj
