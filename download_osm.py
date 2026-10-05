@@ -245,21 +245,37 @@ def build_query(bbox, features, timeout, custom_tags=""):
     return "[out:json][timeout:%d];\n(\n  %s\n);\nout geom;" % (timeout, "\n  ".join(filters))
 
 
-def overpass_query(query, timeout):
+def overpass_query(query, timeout, progress=None):
     last_error = None
     for endpoint in OVERPASS_ENDPOINTS:
         for attempt in range(2):
             try:
-                resp = requests.post(endpoint, data={"data": query}, headers=HEADERS, timeout=timeout + 30)
-                if resp.status_code in (429, 502, 503, 504):
-                    last_error = RuntimeError(f"{endpoint}: HTTP {resp.status_code}")
-                    time.sleep(10 * (attempt + 1))
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                if "elements" not in data:
-                    raise RuntimeError(f"{endpoint}: unexpected response {str(data)[:200]}")
-                return data
+                with requests.post(
+                    endpoint,
+                    data={"data": query},
+                    headers=HEADERS,
+                    timeout=timeout + 30,
+                    stream=True,
+                ) as resp:
+                    if resp.status_code in (429, 502, 503, 504):
+                        last_error = RuntimeError(f"{endpoint}: HTTP {resp.status_code}")
+                        time.sleep(10 * (attempt + 1))
+                        continue
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    if total < 1024:
+                        total = 0
+                    chunks = []
+                    received = 0
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        chunks.append(chunk)
+                        received += len(chunk)
+                        if progress is not None:
+                            progress(received, total)
+                    data = json.loads(b"".join(chunks))
+                    if "elements" not in data:
+                        raise RuntimeError(f"{endpoint}: unexpected response {str(data)[:200]}")
+                    return data
             except (requests.RequestException, ValueError) as exc:
                 last_error = exc
                 time.sleep(5)
@@ -344,9 +360,13 @@ def _relation_geometry(el):
     return unary_union(polys)
 
 
-def elements_to_gdf(data):
+def elements_to_gdf(data, progress=None):
     rows = []
-    for el in data.get("elements", []):
+    elements = data.get("elements", [])
+    total = len(elements)
+    for i, el in enumerate(elements):
+        if progress is not None and (i % 200 == 0 or i == total - 1):
+            progress(i + 1, total)
         el_type = el.get("type")
         if el_type == "node" and "lat" in el and "lon" in el:
             geom = Point(el["lon"], el["lat"])
@@ -432,8 +452,15 @@ def main():
     if args.tags.strip():
         selected = f"{selected}, tags: {args.tags.strip()}" if selected else f"tags: {args.tags.strip()}"
     print(f"Downloading from Overpass: {selected} ...")
-    data = overpass_query(query, args.timeout)
-    print(f"  received {len(data.get('elements', []))} elements")
+
+    def console_progress(received, total):
+        line = f"  downloading: {received / 1e6:.2f} MB"
+        if total:
+            line += f" of {total / 1e6:.2f} MB ({min(received / total, 1.0):.0%})"
+        print("\r" + line, end="", flush=True)
+
+    data = overpass_query(query, args.timeout, progress=console_progress)
+    print(f"\r  received {len(data.get('elements', []))} elements" + " " * 30)
 
     if args.raw:
         raw_path = Path(args.out).with_suffix(".osm.json")

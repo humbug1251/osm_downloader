@@ -152,19 +152,34 @@ if run:
     if not features and not custom_tags.strip():
         st.error("Select at least one feature type or enter custom OSM tags")
     else:
+        bar = st.progress(0.0, text="Resolving extent...")
         try:
             with tempfile.TemporaryDirectory(prefix="osm_web_") as tmp:
                 workdir = Path(tmp)
-                with st.spinner("Resolving extent..."):
-                    bbox, clip_geom, label = resolve_extent(mode, area_text or "", shp_files, kml_file, workdir)
-                    if buffer_m > 0:
-                        bbox = osm.expand_bbox(bbox, buffer_m)
-                        if clip_geom is not None:
-                            clip_geom = osm.buffer_geometry(clip_geom, buffer_m)
-                with st.spinner("Downloading from Overpass API..."):
-                    query = osm.build_query(bbox, features, 180, custom_tags)
-                    data = osm.overpass_query(query, 180)
-                    gdf = osm.elements_to_gdf(data)
+                bbox, clip_geom, label = resolve_extent(mode, area_text or "", shp_files, kml_file, workdir)
+                if buffer_m > 0:
+                    bbox = osm.expand_bbox(bbox, buffer_m)
+                    if clip_geom is not None:
+                        clip_geom = osm.buffer_geometry(clip_geom, buffer_m)
+                bar.progress(0.08, text=f"Extent: {label}")
+
+                def download_progress(received, total):
+                    if total:
+                        frac = 0.10 + 0.65 * min(received / total, 0.95)
+                        bar.progress(frac, text=f"Downloading from Overpass... {received / 1e6:.2f} of {total / 1e6:.2f} MB")
+                    else:
+                        bar.progress(0.45, text=f"Downloading from Overpass... {received / 1e6:.2f} MB")
+
+                query = osm.build_query(bbox, features, 180, custom_tags)
+                data = osm.overpass_query(query, 180, progress=download_progress)
+
+                n_elements = max(len(data.get("elements", [])), 1)
+
+                def parse_progress(i, total):
+                    bar.progress(0.75 + 0.20 * i / n_elements, text=f"Converting elements... {i} of {total}")
+
+                gdf = osm.elements_to_gdf(data, progress=parse_progress)
+                bar.progress(0.96, text="Clipping and writing output...")
                 if clip_geom is not None and not gdf.empty:
                     mask = gpd.GeoDataFrame(geometry=[clip_geom], crs="EPSG:4326")
                     gdf = gpd.clip(gdf, mask)
@@ -184,7 +199,9 @@ if run:
                     "mime": mime,
                     "tags": custom_tags.strip(),
                 }
+                bar.progress(1.0, text="Done")
         except Exception as exc:
+            bar.empty()
             st.session_state.pop("result", None)
             st.error(f"Download failed: {exc}")
 
