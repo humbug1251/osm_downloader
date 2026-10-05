@@ -145,7 +145,6 @@ with st.sidebar:
     )
     st.caption("Any OSM tag: `key`, `key=value`, `key~regex`, `key!=value`")
     buffer_m = st.number_input("Buffer around extent (m)", min_value=0.0, max_value=50000.0, value=0.0, step=50.0)
-    fmt = st.radio("Output format", ["GPKG", "GeoJSON", "Shapefile (zip)"])
     run = st.button("Download OSM data", type="primary", use_container_width=True)
 
 if run:
@@ -179,24 +178,17 @@ if run:
                     bar.progress(0.75 + 0.20 * i / n_elements, text=f"Converting elements... {i} of {total}")
 
                 gdf = osm.elements_to_gdf(data, progress=parse_progress)
-                bar.progress(0.96, text="Clipping and writing output...")
+                bar.progress(0.96, text="Clipping to extent...")
                 if clip_geom is not None and not gdf.empty:
                     mask = gpd.GeoDataFrame(geometry=[clip_geom], crs="EPSG:4326")
                     gdf = gpd.clip(gdf, mask)
                     gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
-                if gdf.empty:
-                    file_bytes, file_name, mime = None, None, None
-                else:
-                    file_bytes, file_name, mime = make_outputs(gdf, fmt, workdir)
                 st.session_state["result"] = {
                     "gdf": gdf,
                     "clip_geom": clip_geom,
                     "bbox": bbox,
                     "label": label,
                     "raw_count": len(data.get("elements", [])),
-                    "file_bytes": file_bytes,
-                    "file_name": file_name,
-                    "mime": mime,
                     "tags": custom_tags.strip(),
                 }
                 bar.progress(1.0, text="Done")
@@ -221,12 +213,21 @@ else:
         col1.metric("Features", len(gdf))
         col2.metric("Elements from Overpass", result["raw_count"])
         col3.metric("Geometry types", gdf.geom_type.nunique())
+        fmt = st.radio(
+            "Output format",
+            ["GPKG", "GeoJSON", "Shapefile (zip)"],
+            horizontal=True,
+            help="The download button appears right below.",
+        )
+        with tempfile.TemporaryDirectory(prefix="osm_out_") as out_tmp:
+            file_bytes, file_name, mime = make_outputs(gdf, fmt, Path(out_tmp))
+        st.download_button(
+            f"Download {file_name}",
+            data=file_bytes,
+            file_name=file_name,
+            mime=mime,
+            type="primary",
+            use_container_width=True,
+        )
         st.dataframe(gdf.groupby(gdf.geom_type).size().rename("count").rename_axis("geometry"))
         st_folium(build_map(gdf, result["clip_geom"], result["bbox"]), height=560, use_container_width=True, returned_objects=[])
-        st.download_button(
-            f"Download {result['file_name']}",
-            data=result["file_bytes"],
-            file_name=result["file_name"],
-            mime=result["mime"],
-            type="primary",
-        )
