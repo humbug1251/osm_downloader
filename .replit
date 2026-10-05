@@ -1,0 +1,14 @@
+entrypoint = "app.py"
+run = "streamlit run app.py --server.address 0.0.0.0 --server.port=8080 --server.enableCORS=false --server.enableWebsocketCompression=false --server.headless=true"
+onBoot = "pip install -r requirements.txt"
+
+[gitHubImport]
+requiredFiles = [".replit"]
+
+[deployment]
+run = ["sh", "-c", "streamlit run app.py --server.address 0.0.0.0 --server.port=8080 --server.enableCORS=false --server.enableWebsocketCompression=false --server.headless=true"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
