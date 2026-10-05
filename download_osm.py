@@ -8,11 +8,13 @@ Usage examples:
 
 Features: roads, rail, buildings, water, landuse, amenities, power, boundaries, all
 Custom tags (--tags): any OSM tag, e.g. "amenity=school", "highway=bus_stop", "name~Temple", "building!=yes"
+Large extents are split into tiles (--tile-km2, default 50 km2) to avoid Overpass timeouts.
 Output: .gpkg or .geojson (recommended). For .shp a file per geometry type is written.
 """
 
 import argparse
 import json
+import math
 import sys
 import tempfile
 import time
@@ -245,6 +247,51 @@ def build_query(bbox, features, timeout, custom_tags=""):
     return "[out:json][timeout:%d];\n(\n  %s\n);\nout geom;" % (timeout, "\n  ".join(filters))
 
 
+def bbox_area_km2(bbox):
+    south, west, north, east = bbox
+    mid_lat = math.radians((south + north) / 2)
+    height_km = (north - south) * 110.574
+    width_km = (east - west) * 111.320 * math.cos(mid_lat)
+    return max(width_km, 0.0001) * max(height_km, 0.0001)
+
+
+def tile_bbox(bbox, max_tile_km2):
+    if max_tile_km2 <= 0 or bbox_area_km2(bbox) <= max_tile_km2:
+        return [bbox]
+    south, west, north, east = bbox
+    mid_lat = math.radians((south + north) / 2)
+    width_km = (east - west) * 111.320 * math.cos(mid_lat)
+    height_km = (north - south) * 110.574
+    side = math.sqrt(max_tile_km2)
+    cols = max(1, math.ceil(width_km / side))
+    rows = max(1, math.ceil(height_km / side))
+    dlon = (east - west) / cols
+    dlat = (north - south) / rows
+    tiles = []
+    for i in range(rows):
+        for j in range(cols):
+            tiles.append(
+                (south + i * dlat, west + j * dlon, south + (i + 1) * dlat, west + (j + 1) * dlon)
+            )
+    return tiles
+
+
+def download_features(bbox, features, timeout, custom_tags="", tile_km2=50, progress=None):
+    tiles = tile_bbox(bbox, tile_km2)
+    elements = {}
+    for i, tile in enumerate(tiles):
+        query = build_query(tile, features, timeout, custom_tags)
+        if progress is not None:
+            def tile_progress(received, total, _i=i):
+                progress(_i, len(tiles), received, total)
+        else:
+            tile_progress = None
+        data = overpass_query(query, timeout, progress=tile_progress)
+        for el in data.get("elements", []):
+            elements[(el.get("type"), el.get("id"))] = el
+    return {"elements": list(elements.values())}
+
+
 def overpass_query(query, timeout, progress=None):
     last_error = None
     for endpoint in OVERPASS_ENDPOINTS:
@@ -418,6 +465,9 @@ def parse_args():
     )
     parser.add_argument("--buffer", "-b", type=float, default=0.0,
                         help="Extra buffer around the extent in meters (default: 0)")
+    parser.add_argument("--tile-km2", type=float, default=50.0,
+                        help="Split the extent into tiles of at most this size to avoid "
+                             "Overpass timeouts/memory spikes (default: 50; 0 disables)")
     parser.add_argument("--out", "-o", default="osm_download.gpkg",
                         help="Output .gpkg/.geojson (default: osm_download.gpkg)")
     parser.add_argument("--raw", action="store_true", help="Also save the raw Overpass JSON")
@@ -447,19 +497,19 @@ def main():
     print(f"  extent: {label}")
     print(f"  bbox (S,W,N,E): {bbox[0]:.6f}, {bbox[1]:.6f}, {bbox[2]:.6f}, {bbox[3]:.6f}")
 
-    query = build_query(bbox, features, args.timeout, args.tags)
     selected = ", ".join(features) if features else ""
     if args.tags.strip():
         selected = f"{selected}, tags: {args.tags.strip()}" if selected else f"tags: {args.tags.strip()}"
-    print(f"Downloading from Overpass: {selected} ...")
+    n_tiles = len(tile_bbox(bbox, args.tile_km2))
+    print(f"Downloading from Overpass: {selected} ({n_tiles} tile(s)) ...")
 
-    def console_progress(received, total):
-        line = f"  downloading: {received / 1e6:.2f} MB"
+    def console_progress(tile_i, tile_n, received, total):
+        line = f"  tile {tile_i + 1}/{tile_n}: {received / 1e6:.2f} MB"
         if total:
             line += f" of {total / 1e6:.2f} MB ({min(received / total, 1.0):.0%})"
         print("\r" + line, end="", flush=True)
 
-    data = overpass_query(query, args.timeout, progress=console_progress)
+    data = download_features(bbox, features, args.timeout, args.tags, args.tile_km2, console_progress)
     print(f"\r  received {len(data.get('elements', []))} elements" + " " * 30)
 
     if args.raw:

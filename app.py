@@ -26,6 +26,8 @@ GEOM_COLORS = {
     "MultiPolygon": "#4daf4a",
 }
 
+MAX_MAP_FEATURES = 10000
+
 st.set_page_config(page_title="OSM Downloader", layout="wide")
 st.title("OSM Data Downloader")
 st.caption("Define the extent with a shapefile, KML/KMZ, or place name; data comes from the Overpass API.")
@@ -101,7 +103,12 @@ def build_map(gdf, clip_geom, bbox):
             fill=False,
             tooltip="Extent",
         ).add_to(m)
-    for geom_type, sub in gdf.groupby(gdf.geom_type):
+    display = gdf
+    if len(display) > MAX_MAP_FEATURES:
+        display = display.sample(MAX_MAP_FEATURES, random_state=0)
+    display = display.copy()
+    display["geometry"] = display.geometry.simplify(0.0001)
+    for geom_type, sub in display.groupby(display.geom_type):
         color = GEOM_COLORS.get(geom_type, "#984ea3")
         group = folium.FeatureGroup(name=f"{geom_type} ({len(sub)})")
         folium.GeoJson(
@@ -145,6 +152,14 @@ with st.sidebar:
     )
     st.caption("Any OSM tag: `key`, `key=value`, `key~regex`, `key!=value`")
     buffer_m = st.number_input("Buffer around extent (m)", min_value=0.0, max_value=50000.0, value=0.0, step=50.0)
+    tile_km2 = st.number_input(
+        "Max tile size (km2)",
+        min_value=0.0,
+        max_value=10000.0,
+        value=50.0,
+        step=10.0,
+        help="Large extents are downloaded in tiles to avoid Overpass timeouts and memory spikes. 0 disables tiling.",
+    )
     run = st.button("Download OSM data", type="primary", use_container_width=True)
 
 if run:
@@ -162,15 +177,17 @@ if run:
                         clip_geom = osm.buffer_geometry(clip_geom, buffer_m)
                 bar.progress(0.08, text=f"Extent: {label}")
 
-                def download_progress(received, total):
+                def download_progress(tile_i, tile_n, received, total):
+                    within = min(received / total, 0.95) if total else 0.45
+                    frac = 0.10 + 0.65 * (tile_i + within) / tile_n
+                    text = f"Downloading from Overpass (tile {tile_i + 1} of {tile_n})... {received / 1e6:.2f} MB"
                     if total:
-                        frac = 0.10 + 0.65 * min(received / total, 0.95)
-                        bar.progress(frac, text=f"Downloading from Overpass... {received / 1e6:.2f} of {total / 1e6:.2f} MB")
-                    else:
-                        bar.progress(0.45, text=f"Downloading from Overpass... {received / 1e6:.2f} MB")
+                        text += f" of {total / 1e6:.2f} MB"
+                    bar.progress(frac, text=text)
 
-                query = osm.build_query(bbox, features, 180, custom_tags)
-                data = osm.overpass_query(query, 180, progress=download_progress)
+                data = osm.download_features(
+                    bbox, features, 180, custom_tags, tile_km2=tile_km2, progress=download_progress
+                )
 
                 n_elements = max(len(data.get("elements", [])), 1)
 
@@ -192,6 +209,10 @@ if run:
                     "tags": custom_tags.strip(),
                 }
                 bar.progress(1.0, text="Done")
+        except MemoryError:
+            bar.empty()
+            st.session_state.pop("result", None)
+            st.error("Ran out of memory. Reduce the extent, lower the tile size (km2), or select fewer features.")
         except Exception as exc:
             bar.empty()
             st.session_state.pop("result", None)
@@ -230,4 +251,9 @@ else:
             use_container_width=True,
         )
         st.dataframe(gdf.groupby(gdf.geom_type).size().rename("count").rename_axis("geometry"))
+        if len(gdf) > MAX_MAP_FEATURES:
+            st.caption(
+                f"Map shows a sample of {MAX_MAP_FEATURES:,} of {len(gdf):,} features; "
+                "the downloaded file contains all of them."
+            )
         st_folium(build_map(gdf, result["clip_geom"], result["bbox"]), height=560, use_container_width=True, returned_objects=[])
